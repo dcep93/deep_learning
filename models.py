@@ -1,5 +1,7 @@
 from __future__ import print_function
 
+import abc
+
 import six.moves.cPickle as pickle
 import timeit
 
@@ -9,7 +11,7 @@ import theano
 import theano.tensor as T
 
 class MLP(object):
-	def __init__(self,raw_options=None):
+	def __init__(self,n_in,n_out,features=[],**raw_options=None):
 		options = {
 			"rng": None,
 			"L_reg": [0.00,0.0001],
@@ -18,33 +20,20 @@ class MLP(object):
 		if raw_options:
 			options.update(raw_options)
 
+		self.n_in = n_in
+		self.n_out = n_out
+		self.features = features
+
 		self.rng = numpy.random.RandomState(1234) if options['rng'] is None else options['rng']
 		self.L_reg = numpy.array(options['L_reg'])
 		self.learning_rate = options['learning_rate']
 
 		self.layers = []
 
-		self.built = False
-
-	
-	@classmethod
-	def build(cls,n_in,n_out,features=[],options=None):
-		print('... building the model')
-
-		model = cls(options)
-
-		model.n_in = n_in
-		model.n_out = n_out
-		model.features = features
-
 		for layer_n_out in features:
-			model.new_layer(layer_n_out,True)
+			self.new_layer(layer_n_out)
 
-		model.new_layer(n_out)
-
-		model.built = True
-
-		return model
+		self.new_layer(n_out)
 
 
 	@staticmethod
@@ -62,11 +51,11 @@ class MLP(object):
 		return self
 
 
-	def new_layer(self,n_out,tanh=False):
+	def new_layer(self,n_out,bounds=None):
 		n_in = self.layers[-1].n_out if self.layers else self.n_in
 
-		if tanh:
-			layer = TanhLayer(n_in,n_out,rng=self.rng)
+		if bounds is not None:
+			layer = TanhLayer(n_in,n_out,bounds=bounds,rng=self.rng)
 		else:
 			layer = Layer(n_in,n_out)
 
@@ -75,7 +64,7 @@ class MLP(object):
 		return self
 
 
-	def _get_vars(self):
+	def _get_variables(self):
 		input_variable = T.matrix('x')
 		output_variable = T.vector('y')
 
@@ -93,14 +82,19 @@ class MLP(object):
 
 			output = layer.output(output,W,b)
 
-		return {'input_variable':input_variable,
-				'output_variable':output_variable,
-				'output':output,
-				'params':params,
-				'L_cost':L_cost}
+		variables = {
+			'input_variable':input_variable,
+			'output_variable':output_variable,
+			'output':output,
+			'params':params,
+			'L_cost':L_cost
+		}
+		variables.update(self._class_variables(variables))
+
+		return variables
 
 	
-	def train(self,data,raw_options=None):
+	def train(self,data,**raw_options=None):
 		options = {
 			"batch_size": 20,
 			"max_epochs": 10,
@@ -113,39 +107,33 @@ class MLP(object):
 		print('... training the model')
 
 		partitioned_data = self._partition(data,options['distribution'])
-		for i in partitioned_data:
-			partitioned_data[i] = theano.shared(partitioned_data[i],borrow=True)
 
 		n_train_batches = partitioned_data['train'].shape[0].eval() // options['batch_size']
 		n_valid_batches = partitioned_data['valid'].shape[0].eval() // options['batch_size']
 		n_test_batches  = partitioned_data['test'] .shape[0].eval() // options['batch_size']
 
-		vars = self._get_vars()
+		variables = self._get_variables()
 
-		vars['label'] = self._get_label(vars)
-		vars['cost'] = self._get_cost(vars)
-		vars['score'] = self._get_score(vars)
-
-		total_cost = vars['L_cost'] + vars['cost']
-		updates = [(param, param - self.learning_rate * T.grad(total_cost,param)) for param in vars['params']]
+		total_cost = variables['L_cost'] + variables['cost']
+		updates = [(param, param - self.learning_rate * T.grad(total_cost,param)) for param in variables['params']]
 
 		index = T.lscalar() 
 
 		test_model = theano.function(
 			inputs=[index],
-			outputs=vars['score'],
+			outputs=variables['score'],
 			givens={
-				vars['input_variable']:  partitioned_data['test'][:,:-1][index * options['batch_size']: (index + 1) * options['batch_size']],
-				vars['output_variable']: partitioned_data['test'][:, -1][index * options['batch_size']: (index + 1) * options['batch_size']]
+				variables['input_variable']:  partitioned_data['test'][:,:-1][index * options['batch_size']: (index + 1) * options['batch_size']],
+				variables['output_variable']: partitioned_data['test'][:, -1][index * options['batch_size']: (index + 1) * options['batch_size']]
 			}
 		)
 
 		validate_model = theano.function(
 			inputs=[index],
-			outputs=vars['score'],
+			outputs=variables['score'],
 			givens={
-				vars['input_variable']:  partitioned_data['valid'][:,:-1][index * options['batch_size']: (index + 1) * options['batch_size']],
-				vars['output_variable']: partitioned_data['valid'][:, -1][index * options['batch_size']: (index + 1) * options['batch_size']]
+				variables['input_variable']:  partitioned_data['valid'][:,:-1][index * options['batch_size']: (index + 1) * options['batch_size']],
+				variables['output_variable']: partitioned_data['valid'][:, -1][index * options['batch_size']: (index + 1) * options['batch_size']]
 			}
 		)
 
@@ -153,8 +141,8 @@ class MLP(object):
 			inputs=[index],
 			updates=updates,
 			givens={
-				vars['input_variable']:  partitioned_data['train'][:,:-1][index * options['batch_size']: (index + 1) * options['batch_size']],
-				vars['output_variable']: partitioned_data['train'][:, -1][index * options['batch_size']: (index + 1) * options['batch_size']]
+				variables['input_variable']:  partitioned_data['train'][:,:-1][index * options['batch_size']: (index + 1) * options['batch_size']],
+				variables['output_variable']: partitioned_data['train'][:, -1][index * options['batch_size']: (index + 1) * options['batch_size']]
 			}
 		)
 
@@ -187,7 +175,8 @@ class MLP(object):
 
 					print('\tepoch %i, test score of best model %f%%' % (epoch+1, test_score*100.))
 
-				self.dump(options['model_dump'])
+				if options['model_dump']:
+					self.dump(options['model_dump'])
 
 			if epoch > n_epochs:
 				break
@@ -202,13 +191,12 @@ class MLP(object):
 
 	
 	def predict(self,data,lookup_dict={}):
-		vars = self._get_vars()
-
-		label = self._get_label(vars)
+		variables = self._get_variables()
 
 		predict_model = theano.function( 
-			inputs=[vars['input_variable']], 
-			outputs=label)
+			inputs=[variables['input_variable']], 
+			outputs=variables['label']
+		)
 
 		f = numpy.vectorize(lambda bin_num: lookup_dict[bin_num] if bin_num in lookup_dict else bin_num)
 
@@ -221,6 +209,21 @@ class MLP(object):
 
 		return results
 
+	def score(self, data):
+		variables = self._get_variables()
+
+		score_model = theano.function(
+			inputs=[variables['input_variable'], variables['output_variable']],
+			outputs=variables['score']
+		)
+
+		x = data[:,:-1]
+		y = data[:,-1]
+
+		s = score_model(x, y)
+		return s
+
+
 	@staticmethod
 	def _partition(data,distribution):
 		s = sum(distribution.values())
@@ -231,70 +234,65 @@ class MLP(object):
 		start = 0
 		for i in distribution:
 			end = int(start + distribution[i]*n)
-			partitioned_data[i] = data[start:end]
+			partitioned_data[i] = theano.shared(data[start:end],borrow=True)
 			start = end
 		return partitioned_data
 
-
+	@abc.abstractmethod
+	def _class_variables(cls,variables):
+		pass
 
 
 class Regression(MLP):
-	@classmethod
-	def build(cls,n_in,features=[],raw_options=None):
+	def __init__(self, n_in, features=[], **raw_options=None):
 		options = {
-			"bounds": [-numpy.inf, numpy.inf]
+			"bounds": None
 		}
 		if raw_options:
 			options.update(raw_options)
 
-		model = MLP.build(n_in,1,features,options)
-		model.bounds = numpy.array(options['bounds'])
-		return model
+		super(Regression, self).__init__(n_in, 1, features, options)
+		self.layers[-1].bounds = options["bounds"]
 
-	def _get_cost(self,vars):
-		label = vars['label']
-		output_variable = vars['output_variable']
-		return T.mean((label - output_variable)**2)
 
-	def _get_score(self,vars):
-		cost = vars['cost']
+	@staticmethod
+	def _class_variables(cls,variables):
+		label = variables['output'].flatten()
+
+		output_variable = variables['output_variable']
+		cost = T.mean((label - output_variable)**2) 
+
+
 		param = 1
-		return (param/(cost+param))
+		score = (param/(cost+param))
 
-
-	def _get_label(self,vars):
-		output = vars['output']
-		return output.flatten().clip(self.bounds[0],self.bounds[1])
-
+		return {
+			"label": label,
+			"cost": cost,
+			"score": score
+		}
 
 
 class Classification(MLP):
-	def _get_vars(self):
-		vars = MLP._get_vars()
+	@staticmethod
+	def _class_variables(cls,variables):
+		p_y_given_x = T.nnet.softmax(variables['output'])
+		label = T.argmax(p_y_given_x, axis=1)
 
-		vars['p_y_given_x'] = T.nnet.softmax(vars['output'])
+		output_variable = variables['output_variable']
+		cost = -T.mean(T.log(p_y_given_x)[T.arange(output_variable.shape[0]), output_variable.astype('int32')])
 
-		return vars
+		score = T.mean(T.eq(label,output_variable))
 
-	def _get_score(self,vars):
-		label = vars['label']
-		output_variable = vars['output_variable']
-		return T.mean(T.eq(label,output_variable))
-
-
-	def _get_cost(self,vars):
-		p_y_given_x = vars['p_y_given_x']
-		output_variable = vars['output_variable']
-		return -T.mean(T.log(p_y_given_x)[T.arange(output_variable.shape[0]), output_variable.astype('int32')])
-
-
-	def _get_label(self,vars):
-		p_y_given_x = vars['p_y_given_x']
-		return T.argmax(p_y_given_x, axis=1)
+		return {
+			"label": label,
+			"cost": cost,
+			"score": score
+		}
 
 
 class Layer(object):
-	def __init__(self, n_in, n_out, rng=None):
+	def __init__(self, n_in, n_out, rng=None, bounds=None):
 		if rng is None:
 			self.W_values = numpy.zeros((n_in,n_out),dtype=theano.config.floatX)
 		else:
@@ -311,11 +309,9 @@ class Layer(object):
 	def L(self,W,b):
 		return numpy.array([abs(W).sum(),(W ** 2).sum()])
 
-
 	def output(self,output,W,b):
-		return T.dot(output,W)+b
-
-class TanhLayer(Layer):
-	def output(self,output,W,b):
-		super_output = Layer.output(output,W,b)
-		return T.tanh(super_output)
+		out = T.dot(output,W)+b
+		if self.bounds is not None:
+			sigm = (T.tanh(out) + 1) / 2
+			out = (sigm * (self.bounds[1] - self.bounds[0])) + self.bounds[0]
+		return out
